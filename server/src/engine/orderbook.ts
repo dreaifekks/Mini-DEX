@@ -1,5 +1,7 @@
 // 撮合引擎（纯内存、零依赖）。
 // 规则：价格优先、时间优先（同价 FIFO）；成交价 = maker（挂单方）的价格。
+// 自成交防护（self-trade prevention）：撮合时跳过 owner 与 taker 相同的挂单，
+// 既不撤销也不减少它的数量，继续检查同档后面的单和仍满足限价的下一档。
 // 数据结构：每边一个 Map<价格, Level> + 一个有序价格数组（bids 降序 / asks 升序）。
 // 初学者能读懂 > 极致性能；生产引擎（如 Primit 的 Rust 引擎）会用更高效的结构。
 
@@ -100,15 +102,23 @@ export class OrderBook {
     const fills: Fill[] = [];
     const opposite = this.sideOf(taker.side === "buy" ? "sell" : "buy");
 
-    while (taker.remaining > 0n && opposite.prices.length > 0) {
-      const bestPrice = opposite.prices[0]!;
+    // li = 当前看的对手盘价格档下标。某一档只剩自己的单（跳过后没被吃空）时 li++ 看下一档；
+    // 档位被吃空时从数组删掉，li 不动，下一轮自然指向新的最优档。
+    let li = 0;
+    while (taker.remaining > 0n && li < opposite.prices.length) {
+      const price = opposite.prices[li]!;
       // limit 单只在价格能对上时成交；market 单不看价
-      if (taker.type === "limit" && !this.crosses(taker.side, taker.price, bestPrice)) break;
+      if (taker.type === "limit" && !this.crosses(taker.side, taker.price, price)) break;
 
-      const level = opposite.book.get(bestPrice)!;
-      while (taker.remaining > 0n && level.orders.length > 0) {
-        const maker = level.orders[0]!;
-        // TODO 生产环境需要 self-trade prevention（自成交会刷量，这里为了简单允许）
+      const level = opposite.book.get(price)!;
+      let i = 0;
+      while (taker.remaining > 0n && i < level.orders.length) {
+        const maker = level.orders[i]!;
+        if (maker.owner === taker.owner) {
+          // self-trade prevention：自己的挂单不能当对手盘，原样留在簿上，看同档下一单
+          i++;
+          continue;
+        }
         const qty = taker.remaining < maker.remaining ? taker.remaining : maker.remaining;
         taker.remaining -= qty;
         maker.remaining -= qty;
@@ -118,13 +128,16 @@ export class OrderBook {
           price: maker.price, qty, side: taker.side, ts: taker.ts,
         });
         if (maker.remaining === 0n) {
-          level.orders.shift();
+          level.orders.splice(i, 1); // 吃空的 maker 出簿；i 不动，下一单顶上来
           this.byId.delete(maker.id);
         }
+        // maker 只被部分吃掉时 taker.remaining 必为 0，内层循环自然结束
       }
       if (level.orders.length === 0) {
-        opposite.book.delete(bestPrice);
-        opposite.prices.shift();
+        opposite.book.delete(price);
+        opposite.prices.splice(li, 1);
+      } else {
+        li++;
       }
     }
     return fills;

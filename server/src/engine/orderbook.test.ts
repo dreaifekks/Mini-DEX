@@ -63,6 +63,67 @@ describe("OrderBook", () => {
     expect(r.fills[0]!.maker).toBe("a");
   });
 
+  it("时间优先：同价同时间戳也按提交顺序，先到的吃完才轮到后到的", () => {
+    const ob = new OrderBook();
+    const ts = 1_700_000_000_000; // 三笔挂单时间戳完全相同，只能靠提交序号 seq 分先后
+    const a = ob.submit({ ...limit("a", "sell", "100", "1"), ts }).resting!;
+    const b = ob.submit({ ...limit("b", "sell", "100", "1"), ts }).resting!;
+    const c = ob.submit({ ...limit("c", "sell", "100", "1"), ts }).resting!;
+    const r = ob.submit(market("t", "buy", "1.5"));
+    expect(r.fills.map((f) => [f.makerOrderId, f.qty])).toEqual([
+      [a.id, F("1")],   // a 先到，先被吃完
+      [b.id, F("0.5")], // 然后才轮到 b，只吃掉一半
+    ]);
+    expect(ob.get(a.id)).toBeUndefined();
+    expect(ob.get(b.id)?.remaining).toBe(F("0.5"));
+    expect(ob.get(c.id)?.remaining).toBe(F("1")); // c 还没轮到，原样不动
+    expect(ob.snapshot(5).asks).toEqual([[F("100"), F("1.5")]]);
+  });
+
+  describe("拒绝 self-trade（自成交）", () => {
+    it("同档里跳过自己的单，吃后面别人的单；自己的单原样留在簿上", () => {
+      const ob = new OrderBook();
+      const mine = ob.submit(limit("alice", "sell", "100", "1")).resting!; // alice 自己先挂的卖单
+      ob.submit(limit("bob", "sell", "100", "1"));                        // bob 同价后挂
+      const r = ob.submit(limit("alice", "buy", "100", "1"));             // alice 再买：不能吃到自己
+      expect(r.fills).toHaveLength(1);
+      expect(r.fills[0]!.maker).toBe("bob");
+      expect(r.fills[0]!.taker).toBe("alice");
+      expect(r.resting).toBeNull();
+      expect(ob.get(mine.id)?.remaining).toBe(F("1")); // 自己的挂单没被撤、没被减
+      expect(ob.snapshot(5).asks).toEqual([[F("100"), F("1")]]);
+    });
+
+    it("整档只有自己的单时，继续吃仍满足限价的下一档", () => {
+      const ob = new OrderBook();
+      const mine = ob.submit(limit("alice", "sell", "100", "1")).resting!; // 最优价只有自己
+      ob.submit(limit("bob", "sell", "101", "1"));                        // 下一档是别人
+      const r = ob.submit(limit("alice", "buy", "105", "1"));
+      expect(r.fills).toHaveLength(1);
+      expect(r.fills[0]!.maker).toBe("bob");
+      expect(r.fills[0]!.price).toBe(F("101")); // 跳过自己的 100，按 bob 的 101 成交
+      expect(ob.get(mine.id)?.remaining).toBe(F("1"));
+      expect(ob.bestAsk()).toBe(F("100"));      // 自己的单仍是卖一
+    });
+
+    it("对手盘全是自己：limit 单不成交只挂单，market 单不成交也不挂", () => {
+      const ob = new OrderBook();
+      const mine = ob.submit(limit("alice", "sell", "100", "2")).resting!;
+
+      const lim = ob.submit(limit("alice", "buy", "100", "1"));
+      expect(lim.fills).toHaveLength(0);
+      expect(lim.resting?.remaining).toBe(F("1")); // 买单挂到 bids，与自己的卖单并存
+      expect(ob.bestBid()).toBe(F("100"));
+
+      const mkt = ob.submit(market("alice", "sell", "1")); // 自己的市价卖单也不能吃自己的买单
+      expect(mkt.fills).toHaveLength(0);
+      expect(mkt.resting).toBeNull();
+
+      expect(ob.get(mine.id)?.remaining).toBe(F("2"));
+      expect(ob.snapshot(5)).toEqual({ bids: [[F("100"), F("1")]], asks: [[F("100"), F("2")]] });
+    });
+  });
+
   it("market 买单：吃穿多个档位", () => {
     const ob = new OrderBook();
     ob.submit(limit("a", "sell", "100", "1"));
